@@ -26,77 +26,98 @@ fn main() {
     let args = Args::parse();
 
     let parts: Vec<&str> = args.token.split('.').collect();
+    if parts.len() != 3 {
+        eprintln!("Invalid JWT");
+        return;
+    }
+
     let message = format!("{}.{}", parts[0], parts[1]);
+    let msg_bytes = message.into_bytes();
     let signature = parts[2].to_string();
 
     let found = Arc::new(AtomicBool::new(false));
 
     if let Some(wordlist) = args.wordlist {
-        let file = File::open(wordlist).unwrap();
-        let reader = BufReader::new(file);
+        if let Ok(file) = File::open(wordlist) {
+            let reader = BufReader::new(file);
+            let secrets: Vec<String> = reader.lines().filter_map(Result::ok).collect();
 
-        let secrets: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+            secrets.par_iter().for_each(|secret| {
+                if found.load(Ordering::Relaxed) {
+                    return;
+                }
 
-        secrets.par_iter().for_each(|secret| {
-            if found.load(Ordering::Relaxed) {
-                return;
-            }
-
-            if check(secret, &message, &signature) {
-                println!("[+] Secret found: {}", secret);
-                found.store(true, Ordering::Relaxed);
-            }
-        });
+                if check(secret.as_bytes(), &msg_bytes, &signature) {
+                    println!("[+] Secret found: {}", secret);
+                    found.store(true, Ordering::Relaxed);
+                }
+            });
+        }
     }
 
     if let Some(mask) = args.mask {
-        let charset = build_charset(&mask);
+        let sets = parse_mask(&mask);
 
-        charset.par_iter().for_each(|candidate| {
-            if found.load(Ordering::Relaxed) {
-                return;
-            }
-
-            if check(candidate, &message, &signature) {
-                println!("[+] Secret found: {}", candidate);
-                found.store(true, Ordering::Relaxed);
-            }
-        });
+        generate_and_check(
+            &sets,
+            &msg_bytes,
+            &signature,
+            &found,
+            String::new(),
+        );
     }
 }
 
-fn check(secret: &str, message: &str, signature: &str) -> bool {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(message.as_bytes());
-    let result = mac.finalize().into_bytes();
-
-    let encoded = URL_SAFE_NO_PAD.encode(result);
-
-    encoded == signature
+fn check(secret: &[u8], message: &[u8], signature: &str) -> bool {
+    if let Ok(mut mac) = HmacSha256::new_from_slice(secret) {
+        mac.update(message);
+        let result = mac.finalize().into_bytes();
+        let encoded = URL_SAFE_NO_PAD.encode(result);
+        return encoded == signature;
+    }
+    false
 }
 
-fn build_charset(mask: &str) -> Vec<String> {
-    let mut sets = Vec::new();
+fn parse_mask(mask: &str) -> Vec<Vec<char>> {
+    mask.split('?')
+        .skip(1)
+        .map(|chunk| match chunk.chars().next().unwrap_or(' ') {
+            'l' => ('a'..='z').collect(),
+            'd' => ('0'..='9').collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
 
-    for chunk in mask.split('?').skip(1) {
-        match chunk.chars().next().unwrap() {
-            'l' => sets.push(('a'..='z').collect::<Vec<char>>()),
-            'd' => sets.push(('0'..='9').collect::<Vec<char>>()),
-            _ => panic!("Unsupported mask"),
-        }
+fn generate_and_check(
+    sets: &[Vec<char>],
+    message: &[u8],
+    signature: &str,
+    found: &Arc<AtomicBool>,
+    prefix: String,
+) {
+    if found.load(Ordering::Relaxed) {
+        return;
     }
 
-    let mut results = vec![String::new()];
-
-    for set in sets {
-        let mut new_results = Vec::new();
-        for prefix in &results {
-            for c in &set {
-                new_results.push(format!("{}{}", prefix, c));
-            }
+    if sets.is_empty() {
+        if check(prefix.as_bytes(), message, signature) {
+            println!("[+] Secret found: {}", prefix);
+            found.store(true, Ordering::Relaxed);
         }
-        results = new_results;
+        return;
     }
 
-    results
+    let (first, rest) = sets.split_first().unwrap();
+
+    first.par_iter().for_each(|c| {
+        if found.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut new_prefix = prefix.clone();
+        new_prefix.push(*c);
+
+        generate_and_check(rest, message, signature, found, new_prefix);
+    });
 }
